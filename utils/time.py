@@ -7,6 +7,8 @@
 #  Copyright (c) 2020, Sam (sam@hey.com)
 
 import datetime
+from functools import partial
+from collections import Counter
 import re
 
 from dateparser.search.search import DateSearchWithDetection
@@ -16,6 +18,33 @@ from discord.ext import commands
 from utils import converters
 
 class TimerConverter(commands.Converter):
+
+    def __init__(self):
+        self.ddp = DateSearchWithDetection()
+        self.settings = {'TIMEZONE': 'UTC', 'PREFER_DATES_FROM': 'future'}
+        self.search_dates = partial(self.ddp.search_dates, settings=self.settings, languages=['en'])
+
+    @staticmethod
+    def _merge_intervals(intervals, sort=True):
+        cnt = 1
+        prev = 0
+        to_merge = intervals[0]
+        merge = []
+        for cumm, (f, s) in enumerate(intervals[1:], start=1):
+            if f - to_merge[1] < 4:
+                cnt += 1
+                to_merge = (to_merge[0], s)
+            else:
+                merge.append((cnt, to_merge, slice(prev, cumm)))
+                cnt = 1
+                prev = cumm
+                to_merge = (f, s)
+        merge.append((cnt, to_merge, slice(prev, len(intervals))))
+
+        # the bigger the cnt, the 'smaller', then the regular rules for intervals
+        if sort:
+            return sorted(merge, key=lambda _: (-_[0], _[1]))
+        return merge
 
     def search_shorts(self, date):
         # matches with `in|on|at` without including them in the result
@@ -28,135 +57,58 @@ class TimerConverter(commands.Converter):
                        (?:(?P<seconds>\d+)[ ]*?(?:seconds?|secs?|s)))
                        """, re.VERBOSE)
 
-        # print(date)
-        # match = re.search(pat, date)
-        # print(match.group())
-        # print(match.lastgroup)
-        # print(match.groupdict())
-        # print(re.findall(pat, date))
-        # print(re.fullmatch(pat, date))
-        # for r in re.finditer(pat, date):
-        #     # print(r.start(), r.end(), r.group(0), r.lastgroup, r.groupdict(), r.group())
-        #     if r.group():
-        #         # print(dir(r.group()))
-        #         r = {v: k for v,k in r.groupdict().items() if k}
-        #         print(r)
-        #         # print(r.start(), r.end(), r.group(0), r.lastgroup, r.groupdict(), r.group())
-        #         print(datetime.datetime.utcnow() + datetime.timedelta(hours=3))
-        #         print(search_dates(f'in {"".join(f"{v} {k}" for k, v in r.items())}'))
-        #         print(search_dates(f'in {"".join(f"{v} {k}" for k, v in r.items())}')[0][1] - (datetime.datetime.utcnow() + datetime.timedelta(hours=3)))
-        #         return search_dates(f'in {"".join(f"{v} {k}" for k, v in r.items())}')[0][1] - (datetime.datetime.utcnow() + datetime.timedelta(hours=3))
-
-
-        dates = [f'in {r.groupdict()[g]} {g}' for r in pat.finditer(date) if (g:=r.lastgroup)]
-        # dates, indexes = [], []
-        ddp = DateSearchWithDetection()
-        settings = {'TIMEZONE': 'UTC', 'PREFER_DATES_FROM': 'future'}
         print('date', date)
-        dates = {}
-        # print('s_dates', ddp.search_dates(date, settings=settings, languages=['en'])['Dates'][0][1])
-        for r in pat.finditer(date):
-            if g := r.lastgroup:
-                # indexes.append(r.span())
-                # dates.append((g, r.groupdict()[g]))
+        dates = {r.span(): (g, r.groupdict()[g]) for r in pat.finditer(date) if (g:=r.lastgroup)}
+        order = {'': -1, 'years': 0, 'months': 1, 'weeks': 2, 'days': 3, 'hours': 4, 'minutes': 5, 'seconds': 6}
 
-                dates[r.span()] = (g, r.groupdict()[g])
-                # dates.append(ddp.search_dates(f'{r.groupdict()[g]} {g}',
-                #                               languages=['en'], settings=settings)['Dates'][0][1])
-                # dates.append(ddp.search_dates("".join(f'{v} {k}' for k, v in r.groupdict().items() if v),
-                #                               languages=['en'], settings=settings)['Dates'][0][1])
-                # dates.append(f'{r.groupdict()[g]} {g}')
-
-        order = {'years': 0, 'months': 1, 'weeks': 2, 'days': 3, 'hours': 4, 'minutes': 5, 'seconds': 6}
         indexes = list(dates.keys())
-        strs = []
-        deleted_chars = 0
-        # first, second
-        for f, s in zip([(0, 0)] + indexes, indexes):
-            print(f, s)
-            # _s - second_start, _e - second_end
-            _s, _e = s
-            # 4 is dummy number for non-times in-between
-            # 4 = ' \w\w ' - THE message
-            if _s - f[1] >= 4:
-                dates.pop(s)
-                continue
+        _, (s, f), _slice = self._merge_intervals(indexes)[0]
+        date = date[:s] + date[f:]
+        vals = list(dates.values())[_slice]
+        strs = ['']
 
-            # deleting matched parts of `date`
-            date = date[:_s - deleted_chars] + date[_e - deleted_chars:]
-            # should be working
-            deleted_chars += _e - _s
-
-            # joining found time parts based on the `order`
-            # so '5 minutes', '3 seconds' becomes '5 minutes 3 seconds'
-            # but '5 minutes', '3 minutes' remains unchanged
-            if f == (0, 0):
-                curr_str = f'{dates[s][1]} {dates[s][0]} '
-                continue
-            (n, v), (_n, _v) = dates[f], dates[s]
-            if order[n] >= order[_n]:
-                strs.append(curr_str)
-                curr_str = f'{_v} {_n} '
+        # ('', '') will have order -1, which is less than any possible one
+        # will add the second argument to the '' -> 'the second argument'
+        # `strs[~0]` = curr_str
+        for (n, v), (_n, _v) in zip([('', '')] + vals, vals):
+            if order[n] < order[_n]:
+                strs[~0] += f'{_v} {_n} '
             else:
-                curr_str += f'{_v} {_n} '
-
-        strs.append(curr_str)
+                strs.append(f'{_v} {_n} ')
 
 
-        # reduce
-        # _dates = list(dates.values())
-        # strs = []
-        # curr_str = f'{_dates[0][1]} {_dates[0][0]} '
-        # for f, s in zip(_dates, _dates[1:]):
-        #     if order[f[0]] >= order[s[0]]:
-        #         strs.append(curr_str)
-        #         curr_str = f'{s[1]} {s[0]} '
-        #     else:
-        #         curr_str += f'{s[1]} {s[0]} '
-        # strs.append(curr_str)
-
-        print(dates)
-        print(strs)
-
-        # order = {'years': 0, 'months': 1, 'weeks': 2, 'days': 3, 'hours': 4, 'minutes': 5, 'seconds': 6}
-        # # reduce
-        # strs = []
-        # curr_str = f'{dates[0][1]} {dates[0][0]} '
-        # for f, s in zip(dates, dates[1:]):
-        #     if order[f[0]] >= order[s[0]]:
-        #         strs.append(curr_str)
-        #         curr_str = f'{s[1]} {s[0]} '
-        #     else:
-        #         curr_str += f'{s[1]} {s[0]} '
-        # strs.append(curr_str)
+        # # first, second
+        # for f, s in zip([(0, 0)] + indexes[_slice], indexes[_slice]):
+        #     print(f, s)
+        #     # _s - second_start, _e - second_end
+        #     _s, _e = s
         #
-        # print(indexes)
-        # indexes.reverse()
-        # from itertools import zip_longest
-        # # s - start first, e - end first, _s - start second, _e - end second
-        # for (s, e), (_s, _e) in zip_longest(indexes, indexes[1:], fillvalue=(0, 0)):
-        #     # 4 is dummy number for non-times in-between
-        #     # 4 = ' \w\w ' - THE message
-        #     if s - _e >= 4:
-        #         print('g')
+        #     # deleting matched parts of `date`
+        #     date = date[:_s - deleted_chars] + date[_e - deleted_chars:]
+        #     # should be working
+        #     deleted_chars += _e - _s
+        #
+        #     # joining found time parts based on the `order`
+        #     # so '5 minutes', '3 seconds' becomes '5 minutes 3 seconds'
+        #     # but '5 minutes', '3 minutes' remains unchanged
+        #     if f == (0, 0):
+        #         curr_str = f'{dates[s][1]} {dates[s][0]} '
         #         continue
-        #     date = date[:s] + date[e:]
-        print(f'date: {date!r}')
-        # print(dates)
-        # print(strs)
-        # print(*map(lambda _: ddp.search_dates(_, settings=settings, languages=['en'])['Dates'][0][1], strs))
-        # return tuple(map(search_dates, dates))
+        #     (n, v), (_n, _v) = dates[f], dates[s]
+        #     if order[n] >= order[_n]:
+        #         strs.append(curr_str)
+        #         curr_str = f'{_v} {_n} '
+        #     else:
+        #         curr_str += f'{_v} {_n} '
+        # strs.append(curr_str)
 
+        print(strs)
+        dates = [self.search_dates(_)['Dates'][0][1] for _ in strs]
+        return dates, date.strip(' .,'), (s, f)
 
-
-        # for match in re.search(pat, date):
-        #     # any short names are better be replaces with their full?
-        #     print(match.groupdict())
-        #     pass
-
-    def parse_time(self, text):
-        for date in search_dates(text, ['en']):
-            pass
+    # def parse_time(self, text):
+    #     for date in search_dates(text, ['en']):
+    #         pass
 
     async def convert(self, ctx, argument):
         # first step: parsing into `time` `message` `-c channel`
@@ -184,7 +136,12 @@ class TimerConverter(commands.Converter):
         #             if not channel.permissions_for(user).send_messages:
         #                 raise getattr(commands, perm)(['send_messages'], channel, ctx.guild)
 
-        times, message = parse(argument[:_c])
+        times, message, pos = self.search_shorts(argument[:_c])
+
+        dates = self.search_dates(message)['Dates']
+        for text, time in dates:
+            times.append(time)
+            message = message.replace(text, '')
 
         return times, message, _ch
 
@@ -241,6 +198,7 @@ def test():
     print(t.search_shorts('5mins 22nd December print me'))
     print(t.search_shorts('5mins, 2secs3hours my damn text'))
     print(t.search_shorts('5mins cu in 5min'))
+    print(t.search_shorts('5 mins 4mins daet 8mins 7mins date 9mins 1min'))
 
     # print(search_dates('monday next week'))
     # print(d(minutes=5))
