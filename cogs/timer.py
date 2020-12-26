@@ -279,21 +279,39 @@ class Timer(commands.Cog, name=Path(__file__).stem):
 
     @commands.group(name='timer', invoke_without_command=True)
     async def timer(self, ctx):
+        # put `timer list` in here?
         pass
 
     @timer.command(name='set')
     async def set_timer(self, ctx, *, args: TimerConverter):  # TODO parser
+        """Sets the timer: <times> <message> [-c channel]
+
+        The timer can either be one-shot or with multiple times, i.e. `timer set 5s 10s` will
+        blast two times: in 5 seconds and in 10 seconds
+
+        Optional arguments:
+            -c - destination timer channel (one should be in the channel's server and has "Send Messages" permission)
+                 (defaults to the current)
+
+        """
         timer = await self._set_timer('this', args.times, args.extra, created_at=ctx.message.created_at,
                                       author_id=ctx.author.id, message_id=ctx.message.id)
         await ctx.send('The timer is set')
 
     @timer.command(name='skip', aliases=['delete', 'cancel'])
     async def skip_timer(self, ctx, id: int, times: int = 1):
+        """Skip the timer with given ID given number of times
+
+        If the `times` is greater than the the remaining number of blasts, the timer
+        is cancelled.
+        If invoked with `delete` or `cancel`, deletes the timer despite the number of
+        remaining blasts
+        """
         times = max(1, times)
         if ctx.invoked_with in ('delete', 'cancel'):
             times = 0
 
-        if not ctx.author.has_permissions(manage_messages=True):
+        if not ctx.author.permissions_in(ctx.channel).manage_messages:
             query = '''DELETE FROM timers WHERE id=$1 AND event='this' AND extra#>'{"kw","author_id"}'=$2'''
             q_args = [id, ctx.author.id]
             res = await self._skip_timer(q_args, times=times, delete=True, query=query)
@@ -308,65 +326,70 @@ class Timer(commands.Cog, name=Path(__file__).stem):
         if not query:
             query = '''DELETE FROM timers WHERE id=$1 RETURNING *'''
         if not isinstance(q_args, list):
-            q_args = list(q_args)
+            q_args = [q_args]
 
         print('_skip_timer before conn')
         async with self.bot.pool.acquire() as conn:
             print('about to delete and receive the record in _skip_timer')
-            record = await conn.fetchrow(query, *q_args)
-            if not record:
-                return f'Couldn\'t find the timer with ID {id}'
+            records = await conn.fetch(query, *q_args)
+            if not records:
+                # `clear_timers` doesn't use id as its q_args...
+                # not anymore, since UX has been applied
+                return f'Couldn\'t find the timer with ID {q_args[0]}'
             # shifting: the next time in `record.times` becomes `record.expires`
             # in, actually, _set_timer during argument parsing
-            timer = TimerConfig.from_record(record)
-            if not times:
-                timer.times = []
-            timer.times = timer.times[times-1:]
-            print('timer\'s times', timer.times)
-            if timer.times:
-                # `timer.id` is passed as I want the timer to preserve its id (when it is a repetitive one)
-                timer = await self._set_timer(timer.event, timer.times, timer.args, **timer.kwargs,
-                                              created_at=timer.created_at, id=timer.id)
-                msg = f'Timer (ID {timer.id}) was successfully skipped {times} times'
-            else:
-                msg = f'Timer (ID {timer.id}) is exhausted'
+            msg = ''
+            for record in records:
+                timer = TimerConfig.from_record(record)
+                if not times:
+                    timer.times = []
+                timer.times = timer.times[times-1:]
+                print('timer\'s times', timer.times)
+                if timer.times:
+                    # `timer.id` is passed as I want the timer to preserve its id (when it is a repetitive one)
+                    timer = await self._set_timer(timer.event, timer.times, timer.args, **timer.kwargs,
+                                                  created_at=timer.created_at, id=timer.id)
+                    msg += f'Timer (ID {timer.id}) was successfully skipped {times} time{"s"*(times > 1)}\n'
+                else:
+                    msg += f'Timer (ID {timer.id}) is exhausted\n'
 
-            # `delete` is needed to actually delete the current timer, i.e. to skip the one, that is running
-            # right now. It is only set on user's `skip_timer` command, because `_skip_timer` is also
-            # an internal 'down-counter'. If there was no `delete`, `call_timer` couldn't dispatch
-            # the last timer, as the task would've been cancelled -> no dispatch in `call_timer`
+                # `delete` is needed to actually delete the current timer, i.e. to skip the one, that is running
+                # right now. It is only set on user's `skip_timer` command, because `_skip_timer` is also
+                # an internal 'down-counter'. If there was no `delete`, `call_timer` couldn't dispatch
+                # the last timer, as the task would've been cancelled -> no dispatch in `call_timer`
 
-            # `delete` actually deletes the timer: it is not in the db anymore (see query above),
-            # only a variable. Cancelling the task would clear this variable by setting new value
-            # to it in `dispatch_timers`. If `delete` is False, then this is skipped and the func
-            # just slices `timer.times` (skipping)
+                # `delete` actually deletes the timer: it is not in the db anymore (see query above),
+                # only a variable. Cancelling the task would clear this variable by setting new value
+                # to it in `dispatch_timers`. If `delete` is False, then this is skipped and the func
+                # just slices `timer.times` (skipping)
 
-            # Why not running it without delete? `call_timer` precedes this function,
-            # if the current timer is canceled, `call_timer` cannot run as well
+                # Why not running it without delete? `call_timer` precedes this function,
+                # if the current timer is canceled, `call_timer` cannot run as well
 
-            # This function acts as a 'down counter' for the timer: `expires` + `times` are
-            # its 'counter value'. When the func is called, `times[0]` becomes `expires` and
-            # `times` becomes `times[1:]` (if `kw_times==1`) -> subtracting the counter.
-            # If there was no `delete`, the 'counter' would've been ended on 0, but, without
-            # doing the subsequent function (`dispatch` in this case), which is not logical:
-            # the timer exists, but doesn't call the func, why was it run then?
-            # This problem might've been solved with changing the order in which functions
-            # are called: `dispatch`, `_skip_timer` instead of `_skip_timer`, `dispatch`,
-            # but I decided this might not be the right decision: the `dispatch` calls
-            # another async func, which might take some time to finish, during which another
-            # timer might be ready to blast, however it wouldn't be able to, since the other
-            # is still pending as the current one -> who needs stale timers?
+                # This function acts as a 'down counter' for the timer: `expires` + `times` are
+                # its 'counter value'. When the func is called, `times[0]` becomes `expires` and
+                # `times` becomes `times[1:]` (if `kw_times==1`) -> subtracting the counter.
+                # If there was no `delete`, the 'counter' would've been ended on 0, but, without
+                # doing the subsequent function (`dispatch` in this case), which is not logical:
+                # the timer exists, but doesn't call the func, why was it run then?
+                # This problem might've been solved with changing the order in which functions
+                # are called: `dispatch`, `_skip_timer` instead of `_skip_timer`, `dispatch`,
+                # but I decided this might not be the right decision: the `dispatch` calls
+                # another async func, which might take some time to finish, during which another
+                # timer might be ready to blast, however it wouldn't be able to, since the other
+                # is still pending as the current one -> who needs stale timers?
 
-            # If used with `times = 0`, the current timer is cancelled, while the new one is
-            # waiting for its turn in the db, which, may be the next `_current_timer`
-            if delete and self._current_timer and self._current_timer.id == timer.id:
-                self._task.cancel()
-                self._task = asyncio.get_event_loop().create_task(self.dispatch_timers())
+                # If used with `times = 0`, the current timer is cancelled, while the new one is
+                # waiting for its turn in the db, which, may be the next `_current_timer`
+                if delete and self._current_timer and self._current_timer.id == timer.id:
+                    self._task.cancel()
+                    self._task = asyncio.get_event_loop().create_task(self.dispatch_timers())
             return msg
 
 
     @timer.command(name='list')
     async def list_timers(self, ctx):
+        """Lists all of your timers despite the channel"""
         query = '''SELECT * FROM timers WHERE event='this' AND
          extra #> '{"kw","author_id"}'=$1 ORDER BY expires LIMIT 10'''
         async with ctx.acquire():
@@ -378,25 +401,69 @@ class Timer(commands.Cog, name=Path(__file__).stem):
         for record in records:
             record = TimerConfig.from_record(record)
             e.add_field(name=f'ID {record.id} in {(record.expires - datetime.datetime.utcnow()).seconds} secs',
-                        value=f'{record.args[0]}\n{["One-shot timer",f"With remaining blasts {record.times}"][bool(record.times)]}')
+                        value=f'**{["One-shot timer**",f"With remaining blasts:** {record.times}"][bool(record.times)]}\n{record.args[0]}')
         await ctx.send(embed=e)
 
     @timer.command(name='clear')
     async def clear_timers(self, ctx):
+        """Removes all of your timers despite the channel"""
         # is running two queries good? The other one is in `_skip_timer`
+        # might use two queries for the UX purposes, i.e. for action confirmation?
         query = '''SELECT id FROM timers WHERE event='this' AND extra #> '{"kw", "author_id"}'=$1'''
         async with ctx.acquire():
             res = await ctx.con.fetch(query, ctx.author.id)
-        print(res)
         if not res:
-            await ctx.send('You had no timers to delete')
+            await ctx.send('You have no timers to delete')
         else:
-            for record in res:
-                await self._skip_timer(record['id'], delete=True)
-            await ctx.send('All your timers are successfully gone!')
+            confirm = await ctx.prompt(f'You\'re about to delete all of your timers, IDs: '
+                                       f'{", ".join(map(lambda _:str(_["id"]),res))}\nAre you sure?')
+            _ = {
+                None: 'Took you way too long to decide, try again when you\'re morally ready',
+                True: 'All your timers are successfully gone!',
+                False: 'Darn! All that work is for nothing?.. Hope you had a very good reason'
+            }
+            if confirm:
+                for record in res:
+                    await self._skip_timer(record['id'], delete=True, times=0)
+            await ctx.send(_[confirm])
+            # msg = await ctx.send(f'You\'re about to delete all of your timers, IDs: {", ".join(*map(lambda _:str(_["id"]),res))}\nAre you sure?')
+            # await msg.add_reaction(ctx.tick(True))
+            # await msg.add_reaction(ctx.tick(False))
+            #
+            # confirm = None
+            #
+            # def ch(payload):
+            #     nonlocal confirm
+            #     if payload.message_id == msg.id and payload.user_id == ctx.author.id:
+            #         if str(payload.emoji) == str(ctx.tick(True)):
+            #             confirm = True
+            #             return True
+            #         elif str(payload.emoji) == str(ctx.tick(False)):
+            #             confirm = False
+            #             return True
+            #     return False
+            #
+            # try:
+            #     await self.bot.wait_for('raw_reaction_add', timeout=15.0, check=ch)
+            #     print('here')
+            # except asyncio.TimeoutError:
+            #     await ctx.send('Took you way too long to decide, try again when you\'re morally ready')
+            # else:
+            #     if confirm:
+            #         for record in res:
+            #             await self._skip_timer(record['id'], delete=True, times=0)
+            #         await ctx.send('All your timers are successfully gone!')
+            #     else:
+            #         await ctx.send('Darn! All that work is for nothing?.. Hope you had a very good reason')
+
+        # query = '''DELETE FROM timers WHERE event='this' AND extra #> '{"kw", "author_id"}'=$1 RETURNING *'''
+        # msg = await self._skip_timer(ctx.author.id, query=query, delete=True, times=0)
+        # # startswith 'C' means, there are no timers (see _skip_timer)
+        # await ctx.send('You don\'t have any timers set' if msg.startswith('C') else 'All your timers are gone')
 
     @timer.command(name='info')
     async def info_timer(self, ctx, *, id: int):
+        """Return the info about the timer with the given ID"""
         query = '''SELECT * FROM timers WHERE id=$1 AND event='this' and extra #> '{"kw", "author_id"}'=$2'''
         async with ctx.acquire():
             record = await ctx.con.fetchrow(query, id, ctx.author.id)
@@ -412,8 +479,9 @@ class Timer(commands.Cog, name=Path(__file__).stem):
         await ctx.send(embed=e)
 
     @timer.command(name='channel')
+    @commands.has_permissions(manage_messages=True)
     async def channel_timers(self, ctx):
-        """Returns the list of timers, that will be ran in this channel"""
+        """Returns the list of timers, that will be run in this channel"""
         query = '''SELECT * FROM timers WHERE event='this' AND extra #> '{"a",1}'=$1'''
         async with ctx.acquire():
             records = await ctx.con.fetch(query, ctx.channel.id)
@@ -433,6 +501,7 @@ class Timer(commands.Cog, name=Path(__file__).stem):
         await ctx.send(embed=e)
 
     @timer.command(name='current')
+    @commands.is_owner()
     async def current_timer(self, ctx):
         if self._current_timer is None:
             await ctx.send('There is no current timer')
@@ -446,23 +515,6 @@ class Timer(commands.Cog, name=Path(__file__).stem):
         msg, channel = timer.args
         channel = self.bot.get_channel(channel)
         await channel.send(f'Timer alarm with time {(datetime.datetime.utcnow() - timer.created_at).seconds} seconds: {msg}')
-        #
-        # message = await self._skip_timer(timer.id)
-        # if message is not None:
-        #     await channel.send(message)
-
-
-    # @commands.command()
-    # async def retrieve_channel_id(self, ctx):
-    #     await ctx.send(f'channel_id: {ctx.channel.id}')
-    #
-    # @commands.command()
-    # async def times(self, ctx, *, args):
-    #     await ctx.send(time_parser(args))
-    #
-    # @commands.group()
-    # async def timer(self, ctx):
-    #     pass
 
     @timer.error
     async def timer_error(self, ctx, error):
@@ -484,43 +536,6 @@ class Timer(commands.Cog, name=Path(__file__).stem):
                 await ctx.send(error)
         else:
             await ctx.send(error)
-
-    # async def run_timer(self, channel, message, time, time_to_wait=None):
-    #     if time_to_wait is None:
-    #         time_to_wait = time
-    #     await asyncio.sleep(time_to_wait)
-    #     await channel.send(f'{message} in {time} seconds!')
-    #
-    # async def _job(self, job_name, *args, **kwargs):
-    #     self._task = asyncio.create_task(getattr(self, job_name)(*args, **kwargs))
-    #     await self._task
-
-    # @timer.command()
-    # async def set(self, ctx, *, args: TimerConverter):
-    #     channel, message, times = args
-    #     times = sorted(times + [0.0], reverse=True)
-    #     wtimes = [t - s for t, s in zip([times[0]] + times, times)]
-    #     for time, wtime in zip(times, wtimes):
-    #         await self._job('run_timer', channel, message, time, time_to_wait=wtime)
-    #     self._task = None
-    #     await ctx.send('set')
-    #
-    # @timer.command()
-    # async def unset(self, ctx):
-    #     if self._task:
-    #         self._task.cancel()
-    #         self._task = None
-    #         await ctx.send('Timer was successfully removed')
-    #     else:
-    #         await ctx.send('There is no set timer at the moment')
-    #
-    # @timer.command()
-    # async def alter(self, ctx):
-    #     await ctx.send('alter')
-    #
-    # @timer.command()
-    # async def list(self, ctx):
-    #     await ctx.send('list')
 
 
 def setup(bot):
