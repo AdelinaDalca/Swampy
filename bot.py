@@ -1,9 +1,10 @@
 import os
 
-from dotenv import load_dotenv
-import discord
 import random
+from dotenv import load_dotenv
 
+import discord
+from discord.ext import commands
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -11,50 +12,55 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 intents = discord.Intents.default()
 intents.members = True
 
-client = discord.Client(intents=intents)
+bot = commands.Bot(command_prefix='\\', intents=intents)
 
-@client.event
+@bot.event
 async def on_ready():
-    guild = discord.utils.get(client.guilds, id=int(os.getenv("DISCORD_GUILD_ID")))
-    print(f"{client.user} has connected to Discord!")
-    print(f"{guild} - is one guild of many with id: {guild.id}")
-    members = '\n - '.join([member.name for member in guild.members])
-    print(f'Guild Members:\n - {members}')
+    print(f'{bot.user.name} is connected to Discord!')
 
 
-@client.event
-async def on_member_join(member):
-    await member.create_dm()
-    await member.dm_channel.send(f'Hi, {member.name}, welcome to my brand new server!')
-
-
-
-@client.event
-async def on_message(message):
-    if message.author == client.user:
-        return
-
+@bot.command(name='99')
+async def nine_nine(ctx):
     brooklyn_99_quotes = [
-        "I'm the human form of the 😀 emoji",
-        "Bingpot!",
-        "Cool."
+            "Cool!",
+            "Bingpot!",
+            "I'm the human form of the 😀 emoji!"
             ]
 
-    if message.content == '99!':
-        response = random.choice(brooklyn_99_quotes)
-        await message.channel.send(response)
+    response = random.choice(brooklyn_99_quotes)
+    await ctx.send(response)
+
+
+@bot.command(name='list', help='Show the list of the server\' users')
+async def list(ctx):
+    await ctx.send(f"List of members of this server:\n\t - {f'{chr(10)}{chr(9)} - '.join(_.name for _ in ctx.guild.members)}")
+
+
+@bot.command(name='roll_dice', help='Simulates rolling dice')
+async def dice(ctx, number_of_dice: int, number_of_sides: int):
+    dice = [
+        str(random.choice(range(1, number_of_sides + 1)))
+        for _ in range(number_of_dice)
+            ]
+    await ctx.send(', '.join(dice))
+
+
+@bot.command(name='create_channel', help='Creates new channel with specified name')
+@commands.has_role('admin')
+async def create(ctx, *channel_name: str):
+    guild = ctx.guild
+    channel_name = ' '.join(channel_name)
+    existing_channel = discord.utils.get(guild.channels, name=channel_name)
+    if existing_channel:
+        await ctx.send('Such a channel already exists')
     else:
-        raise discord.DiscordException
+        await ctx.send(f'Creating new channel: {channel_name}')
+        await guild.create_text_channel(channel_name)
 
 
-@client.event
-async def on_error(event, *args, **kwargs):
-    with open('err.log', 'a') as f:
-        if event == 'on_message':
-            f.write(f'Unhandled message {args[0]}\n')
-        else:
-            raise
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.errors.CheckFailure):
+        await ctx.send('You don\'t have the correct role for this command')
 
-
-client.run(TOKEN)
-
+bot.run(TOKEN)
