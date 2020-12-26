@@ -39,14 +39,12 @@ class BasicTable(db.Table, table_name='basic'):
 class ChannelsTable(db.Table, table_name='channels'):
 
     columns = [
-        'guild_id BIGINT',
         'id BIGINT PRIMARY KEY',
         'spam BIT(3) NOT NULL DEFAULT 7::BIT(3)',
-        'FOREIGN KEY (guild_id) REFERENCES guilds(id) ON DELETE CASCADE',
     ]
 
 
-class BasicConfig:
+class BasicConfig(db.ConfigBase):
 
     __slots__ = ('guild_id', 'cat_name', 'ch_name', 'pins')  # , spam)
 
@@ -62,23 +60,18 @@ class BasicConfig:
 
         return self
 
-    def __repr__(self):
-        return f'<{self.__class__.__name__}>: {"; ".join(f"({_} {repr(getattr(self, _))})" for _ in self.__slots__)}'
 
+class ChannelsConfig(db.ConfigBase):
 
-class ChannelsConfig:
-
-    __slots__ = ('spam')
+    __slots__ = ('channel_id', 'spam')
 
     @classmethod
     async def from_record(cls, record):
         self = cls()
-
+        print(record)
+        self.channel_id = record['id']
         self.spam = record['spam'].to_int() # BitString
         return self
-
-    def __repr__(self):
-        return f'<{self.__class__.__name__}>: {"; ".join(f"({_} {repr(getattr(self, _))})" for _ in self.__slots__)}'
 
 
 # TODO on_member_join\update, on_role_delete, on_guild_role_update?
@@ -89,6 +82,14 @@ class BasicCog(commands.Cog, name=Path(__file__).stem):
     def __init__(self, bot):
         self.bot = bot
         self.change_status.start()
+        # needed to prevent race condition between `on_message.get_channels_config`
+        # and `spam.get_channels_config`. It limits the number to the resource to one,
+        # which prevents the following situation:
+        #   `spam` calls `get_channels_config`, which inserts the needed data, if there is none,
+        #   while `spam` wait for the insertion, `on_message` calls `get_channels_config`, which
+        #   doesn't have the needed record either resulting in to inserts, one of which throws
+        #   duplicate key error
+        self._channels_db_lock = asyncio.Lock()
 
     def cog_unload(self):
         self.change_status.cancel()
@@ -111,7 +112,6 @@ class BasicCog(commands.Cog, name=Path(__file__).stem):
         await self.bot.wait_until_ready()
 
     @commands.command(name='spam', help='Defines the behaviour of spamming messages')
-    @commands.has_permissions(manage_messages=True)
     async def spam(self, ctx, mode: int = None):
         """Manages spam messages on this particular channel
 
@@ -129,7 +129,10 @@ class BasicCog(commands.Cog, name=Path(__file__).stem):
         To manage, have Manage Messages permission
         """
 
-        config = await self.get_basic_config(ctx.guild.id)
+        if ctx.guild is not None and not ctx.channel.permissions_for(ctx.author).manage_messages:
+            return
+
+        config = await self.get_channels_config(ctx.channel.id)
         spam = config.spam
 
         if mode:
@@ -137,11 +140,11 @@ class BasicCog(commands.Cog, name=Path(__file__).stem):
                 await ctx.send('The mode number should be within [0, 7]')
                 logger.info('%s, input value: %s', ctx.message.author.name, mode)
                 return
-            query = '''INSERT INTO basic(guild_id, spam) VALUES($1, $2) ON CONFLICT (guild_id) DO UPDATE SET spam=$2 RETURNING spam'''
+            query = '''UPDATE channels SET spam=$2 WHERE id=$1 RETURNING spam'''
             async with ctx.acquire():
                 # `spam` in the table is of `BitString` type, hence the need in `from_int` and `to_int` here
-                spam = (await ctx.con.fetchval(query, ctx.guild.id, BitString.from_int(mode, 3))).to_int()
-            self.get_basic_config.invalidate(self, ctx.guild.id)
+                spam = (await ctx.con.fetchval(query, ctx.channel.id, BitString.from_int(mode, 3))).to_int()
+            self.get_channels_config.invalidate(self, ctx.channel.id)
         await ctx.send(', '.join(
             f'{(s := "*~"[b == "0"] * 2)}{w}{s}' for b, w in zip(f'{spam:03b}', 'strong rush farm'.split())))
 
@@ -151,6 +154,7 @@ class BasicCog(commands.Cog, name=Path(__file__).stem):
     async def spam_error(self, ctx, error):
         command, *arg = ctx.message.content.split(maxsplit=1)
         if isinstance(error, commands.errors.CheckFailure):
+            print(error)
             await ctx.send("Only Gods themselves shall rule the Spam!\n||doesn't mean YOU can't become one||")
         elif isinstance(error, commands.errors.BadArgument):
             await ctx.send(f'Unfortunately, {command} takes one integer argument, not "{" ".join(arg)}"\n'
@@ -170,10 +174,11 @@ class BasicCog(commands.Cog, name=Path(__file__).stem):
             (r'\b(sg|swamp|gator|strong)\b', '💪')
         ]
 
-        config = await self.get_basic_config(msg.guild.id)
+        config = await self.get_channels_config(msg.channel.id)
         spam = config.spam
         response = ' '.join(r for i, (t, r) in enumerate(spammer) if spam >> i & 1 and re.search(t, msg.content.lower()))
         if response:
+            # TODO add ability to add reactions instead of sending a standalone message?
             await msg.channel.send(f'🐊{response}')
 
     @cache.cache()
@@ -182,19 +187,22 @@ class BasicCog(commands.Cog, name=Path(__file__).stem):
         async with self.bot.pool.acquire() as conn:
             record = await conn.fetchrow(query, guild_id)
             if record is None:
-                record = await conn.fetchrow('''INSERT INTO basic(guild_id) VALUES($1) 
-                ON CONFLICT (guild_id) DO NOTHING RETURNING *''', guild_id)
+                # record = await conn.fetchrow('''INSERT INTO basic(guild_id) VALUES($1)
+                # ON CONFLICT (guild_id) DO NOTHING RETURNING *''', guild_id)
+
+                # should work unless race condition
+                record = await conn.fetchrow('''INSERT INTO basic(guild_id) VALUES($1) RETURNING *''', guild_id)
             return await BasicConfig.from_record(record)
 
     @cache.cache()
     async def get_channels_config(self, channel_id):
-        query = '''SELECT * FROM channels WHERE channel_id=$1'''
+        query = '''SELECT * FROM channels WHERE id=$1'''
         async with self.bot.pool.acquire() as conn:
-            record = await conn.fetchrow(query, channel_id)
-            if record is None:
-                record = await conn.fetchrow('''INSERT INTO channels(channel_id) VALUES($1)
-                ON CONFLICT (channel_id) DO NOTHING RETURNING *''', channel_id)
-            return await ChannelsConfig.from_record(record)
+            async with self._channels_db_lock:
+                record = await conn.fetchrow(query, channel_id)
+                if record is None:
+                    record = await conn.fetchrow('''INSERT INTO channels(id) VALUES($1) RETURNING *''', channel_id)
+                return await ChannelsConfig.from_record(record)
 
     @commands.Cog.listener()
     async def on_member_join(self, member):
@@ -234,6 +242,10 @@ class BasicCog(commands.Cog, name=Path(__file__).stem):
         :return: None
         """
         pass
+
+    @commands.command(name='ch')
+    async def ch(self, ctx):
+        await ctx.send(ctx.guild.channels)
 
     @commands.command(name='pins')
     @commands.has_permissions(manage_messages=True, manage_channels=True)
@@ -278,12 +290,22 @@ class BasicCog(commands.Cog, name=Path(__file__).stem):
                 logger.debug(change)
                 changed = False
 
+                # FIXME doesn't work with unicode
+                #  category = ♥?
                 # 'cat=, ch=, pins='
                 for key, val in payload.items():
                     # logger.debug(re.findall(fr'{key} ?= ?(\w+(?![_ ]?\w+=)[_ ]?\w+|[\w+])', change)+[''])
                     # logger.debug(re.findall(fr'{key} *= *([\w _\']+(?!.*?\w+=)|[\w+]+)', change) + [''])
                     # logger.debug(re.findall(fr'{key} *= *([\w _\']+(?!\w+ *=)[\w\']|[\w+])', change) + [''])
-                    if o := (re.findall(fr'{key} *= *([\w _\']+(?!\w+ *=)[\w\']|[\w+])', change) + [''])[0].lower():
+
+                    # added `|` at the end of the matching group to match nothing -> to set category to None, for
+                    # instance
+                    # logger.debug(re.findall(fr'{key} *= *([\w _\']+(?!\w+ *=)[\w\']|[\w+]|)', change) + [''])
+                    # if o:=(re.findall(fr'{key} *= *([\w _\']+(?!\w+ *=)[\w\']|[\w+]|)',change)+[''])[0].lower():
+                    if o := re.findall(fr'{key} *= *([\w _\']+(?!\w+ *=)[\w\']|[\w+]|)', change):
+                        o = o[0].lower()
+                        if not o and key != 'cat':
+                            continue
                         if key == 'pins':
                             o = o in 'true t 1 enable on set yes y +'.split()
                         changed = True
@@ -302,18 +324,23 @@ class BasicCog(commands.Cog, name=Path(__file__).stem):
     _equal_embeds = lambda _, bef, aft: bef and aft and any(a.to_dict() == b.to_dict() for b in bef for a in aft)
 
     # check of embeds is first since they have no content -> contents of any embeds are always equal empty
-    _eq_msgs = lambda _, f, s: _.equal_embeds(f.embeds, s.embeds) or f.content and f.content == s.content
+    _eq_msgs = lambda _, f, s: _._equal_embeds(f.embeds, s.embeds) or f.content and f.content == s.content
 
     @commands.Cog.listener()
     async def on_message_edit(self, before, after):
+        # DM has no guild
+        if isinstance(before.channel, discord.DMChannel):
+            return
         guild = before.guild
 
         config = await self.get_basic_config(guild.id)
         cat_name, ch_name, pins = config.cat_name, config.ch_name, config.pins
 
-        if not (category := discord.utils.get(before.guild.categories, name=cat_name)) and pins:
+        if not (category := discord.utils.find(lambda _: _.name.lower() == cat_name, before.guild.categories)) and\
+                cat_name and pins:
             category = await guild.create_category(name=cat_name)
             await category.edit(position=0)
+        # turns out, text channels can only have names in lowercase
         if not (ch := discord.utils.get(guild.channels, name=ch_name,
                                         category=category)) and after.pinned and pins:
             ch = await guild.create_text_channel(name=ch_name, category=category)
@@ -364,6 +391,9 @@ class BasicCog(commands.Cog, name=Path(__file__).stem):
 
     @commands.Cog.listener()
     async def on_message_delete(self, message):
+        if isinstance(message.channel, discord.DMChannel):
+            return
+
         guild = message.guild
 
         # TODO if the message is pinned, but the `pins` are off, do nothing?
@@ -371,7 +401,7 @@ class BasicCog(commands.Cog, name=Path(__file__).stem):
             print(message)
             config = await self.get_basic_config(guild.id)
             cat_name, ch_name = config.cat_name, config.ch_name
-            if cat := discord.utils.get(guild.channels, name=cat_name):
+            if cat := discord.utils.find(lambda _: _.name.lower() == cat_name, guild.channels):
                 if ch := discord.utils.get(guild.channels, name=ch_name, category_id=cat.id):
                     await ch.purge(check=lambda m: self._eq_msgs(m, message))
                 else:
